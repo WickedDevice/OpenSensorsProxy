@@ -29,7 +29,7 @@ function postOpenSensorsUrl(url, data){
   });
 }
 
-router.get('/v1/messages/device/:client_id', function(req, res) {
+function delegateToOpenSensors(req, res){
   var originalUrl = API_BASE_URL + req.originalUrl;
   return Promise.try(function(){
     return getOpenSensorsUrl(originalUrl);
@@ -38,6 +38,14 @@ router.get('/v1/messages/device/:client_id', function(req, res) {
     res.statusCode = response.statusCode;
     res.send(response.body);
   });
+}
+
+router.get('/v1/messages/device/:client_id', function(req, res) {
+  return delegateToOpenSensors(req, res);
+});
+
+router.get('/v1/messages/:topic*', function(req, res) {
+  return delegateToOpenSensors(req, res);
 });
 
 module.exports = router;
