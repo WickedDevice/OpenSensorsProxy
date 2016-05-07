@@ -15,6 +15,12 @@ module.exports = function(config) {
     var requests_filename = "./current_requests.json";
     var MAX_CONCURRENT_REQUESTS_IN_FLIGHT = 5;
 
+    // on launch delete ther requests file
+    if(fs.existsSync(requests_filename)) {
+        fs.unlinkSync(requests_filename);
+        console.log("Removed existing requests file: " + requests_filename);
+    }
+
     var API_BASE_URL = "https://api.opensensors.io";
 
     // helper (actually workhorse) method that does a GET to a URL
@@ -259,7 +265,7 @@ module.exports = function(config) {
 
         var status = params ? params.status : null;
 
-        return recursiveGET(url, [], status, true); // follow_next = true
+        return recursiveGET(url, [], status); // don't follow next, that is up to the caller for a proxy
     }
 
     // returns an array of message payloads from the API, augmented with timestamp
