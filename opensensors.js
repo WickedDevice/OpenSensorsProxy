@@ -1,7 +1,6 @@
 var Promise = require("bluebird");
 var bhttp = Promise.promisifyAll(require("bhttp"));
 var fs = Promise.promisifyAll(require("fs"));
-var extend = require('xtend');
 
 // config encapsulates opensensors-api-key
 // valid keys for config are: api-key (required)
@@ -258,7 +257,7 @@ module.exports = function(config) {
 
         url += "/" + val+ urlParams(params);
 
-        var status = params ? extend(params.status) : null;
+        var status = params ? params.status : null;
 
         return recursiveGET(url, [], status, true); // follow_next = true
     }
