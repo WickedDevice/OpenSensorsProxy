@@ -1,6 +1,7 @@
 var Promise = require("bluebird");
-var bhttp = Promise.promisifyAll(require("bhttp"));
-var fs = Promise.promisifyAll(require("fs"));
+var rp = require('request-promise');
+var fs = require("fs");
+var promiseDoWhilst = require('promise-do-whilst');
 
 // config encapsulates opensensors-api-key
 // valid keys for config are: api-key (required)
@@ -21,15 +22,62 @@ module.exports = function(config) {
         console.log("Removed existing requests file: " + requests_filename);
     }
 
+    // create it blank
+    fs.writeFileSync(requests_filename, JSON.stringify([]));
+
     var API_BASE_URL = "https://api.opensensors.io";
+
+    var httpGet = function(url, options){
+        var options = Object.assign(
+          {},
+          {
+            uri: url,
+            resolveWithFullResponse: true,
+            json: true,
+            simple: false
+          },
+          options);
+
+        return rp(options);
+    };
 
     // helper (actually workhorse) method that does a GET to a URL
     // it appends the augmented payloads in the response to the second argument that gets passed to it
     // if the response body JSON contains a next element it recursively calls itself
-    var getUntilNot400 = function(url){
+    var retireRequest = function(theUrl){
+        try {
+            var file_contents = fs.readFileSync(requests_filename, 'utf8');
+            if (file_contents.trim() == "") {
+                file_contents = "[]";
+            }
+            var current_requests = JSON.parse(file_contents);
+
+            // remove url from the list
+            var i = current_requests.indexOf(theUrl);
+            if (i != -1) {
+                current_requests.splice(i, 1);
+            }
+            fs.writeFileSync(requests_filename, JSON.stringify(current_requests));
+        }
+        catch (e) {
+            console.log(requests_filename + ' is corrupt - JSON parse failed');
+            // this is also a really bad situation, but I don't know what can be done about it
+        }
+    };
+
+    var getUntil200 = function(url){
         var theUrl = url;
         var requestsInFlight = 0;
         var current_requests = [];
+      var requestCompletedSuccessfully = false;
+      var fatalError = null;
+      var gotNon200 = false;
+      var gotSaturated = false;
+      var theResponse = null;
+
+      return promiseDoWhilst(() => {
+        // do this promise
+        return Promise.try(() => {
         try{
             var file_contents = fs.readFileSync(requests_filename, 'utf8');
             if(file_contents.trim() == ""){
@@ -39,13 +87,19 @@ module.exports = function(config) {
             requestsInFlight = current_requests.length;
         }
         catch(e){
-            console.log(requests_filename + ' is corrupt - JSON parse failed');
+            console.log(requests_filename + ' is corrupt - JSON parse failed -- deleting it');
+            fs.unlinkSync(requests_filename);
+            file_contents = "[]";
+            current_requests = JSON.parse(file_contents);
+            requestsInFlight = current_requests.length;
         }
 
         if(requestsInFlight < MAX_CONCURRENT_REQUESTS_IN_FLIGHT) {
             // if the server is not saturated, go ahead and make a request and increase the saturation level
 
             // add this request to the list of in flight requests
+            // if it's not already in the list
+            if(current_requests.indexOf(theUrl) == -1) {
             current_requests.push(theUrl);
             try {
                 fs.writeFileSync(requests_filename, JSON.stringify(current_requests));
@@ -54,71 +108,98 @@ module.exports = function(config) {
                 console.log("Failed to write to " + requests_filename);
                 // this is very bad... we really shouldn't proceed at this point with this request
                 // it should in fact be as though we were saturated
-                // just as though we had gotten a 400 response, just try agian sooner
+                // just as though we had gotten a 400 response, just try again sooner
                 console.log("Deferring request " + theUrl + " for 5 seconds");
-                return Promise.delay(5000).then(function () {
-                    return getUntilNot400(theUrl);
-                });
+                return;
             }
 
             return Promise.try(function () {
-                return bhttp.get(theUrl, API_POST_OPTIONS);
+                return httpGet(theUrl, API_POST_OPTIONS);
             }).then(function (response) {
-                if (response.statusCode == 400) {
+                if (response.statusCode !== 200) {
                     console.log(theUrl);
                     console.log(response.body);
-                    console.log("Got 400, waiting 30 seconds before trying " + theUrl + " again");
-                    return Promise.delay(30000).then(function () {
-                        return getUntilNot400(theUrl);
-                    });
+                  console.log("Got Status Code " + response.statusCode + ", waiting 30 seconds before trying " + theUrl + " again");
+                  gotNon200 = true;
                 }
                 else {
                     // finally! we can retire this request from the list and pass the results on
-                    try{
-                        var file_contents = fs.readFileSync(requests_filename, 'utf8');
-                        if(file_contents.trim() == ""){
-                            file_contents = "[]";
+                  retireRequest(theUrl);
+                  requestCompletedSuccessfully = true;
+                  return response;
                         }
-                        current_requests = JSON.parse(file_contents);
-
-                        // remove url from the list
-                        var i = current_requests.indexOf(theUrl);
-                        if(i != -1){
-                            current_requests.splice(i, 1);
+              }).catch(function(error){
+                // kill this request status file
+                retireRequest(theUrl);
+                console.log("+++++++++++++++++++++++");
+                console.log("Error: " + error.message + " " + error.stack);
+                console.log("+++++++++++++++++++++++");
+                // fatalError = error;
+                gotSaturated = true; // treat it like you got a saturated result
+              });
                         }
-                        fs.writeFileSync(requests_filename, JSON.stringify(current_requests));
                     }
-                    catch(e){
-                        console.log(requests_filename + ' is corrupt - JSON parse failed');
-                        // this is also a really bad situation, but I don't know what can be done about it
+          else{
+            console.log("Saturated - Deferring request " + theUrl + " for 5 seconds");
+            gotSaturated = true;
                     }
-
-                    return response;
+        }).then((response) => {
+          if(gotNon200){
+            return new Promise((resolve, reject) => {
+              setTimeout(() => {
+                gotNon200 = false;
+                gotSaturated = false;
+                resolve();
+              }, 30000);
+            });
                 }
+          else if(gotSaturated){
+            return new Promise((resolve, reject) => {
+              setTimeout(() => {
+                gotNon200 = false;
+                gotSaturated = false;
+                resolve();
+              }, 5000);
             });
         }
         else{
-            // otherwise delay for a little while and try again recursively
-            // just as though we had gotten a 400 response, just try agian sooner
-            console.log("Saturated - Deferring request " + theUrl + " for 5 seconds");
-            return Promise.delay(5000).then(function () {
-                return getUntilNot400(theUrl);
+            theResponse = response;
+          }
             });
+      }, () => {
+        // until this function return false, i.e. don't continue
+        return !requestCompletedSuccessfully && !fatalError;
+      }).then(() => {
+        if(!fatalError){
+          return theResponse;
         }
-
-
+        else{
+          throw fatalError;
+        }
+      });
     };
 
     var recursiveGET = function(url, results, status, followNext){
-        console.log("Current Num Results: " + results.length + " -> URL: " + url);
+        var theUrl = url;
+        var theResults = results;
+        var theStatus = Object.assign({}, {}, status);
+        var theFollowNext = followNext;
+
+        console.log(theStatus.serialNumber + " Current Num Results: " + theResults.length + " -> URL: " + theUrl);
+
         return Promise.try(function(){
-            return getUntilNot400(url);
-        }).catch(function(err) {
-            console.error(err);
+            return getUntil200(theUrl);
         }).then(function(response){
+            var theResponse = response;
             var augmentedPayloads = [];
-            if(response.body.messages){
-                augmentedPayloads = response.body.messages.map(function(msg){
+
+            if(!theResponse || !theResponse.body){
+              console.log("%%%%%%%%%%%%%%%%%%%%%%%%%");
+              console.log("% Unexpected Response: ", JSON.stringify(theResponse,null,2));
+              console.log("%%%%%%%%%%%%%%%%%%%%%%%%%");
+            }
+            else if(theResponse.body.messages){
+                augmentedPayloads = theResponse.body.messages.map(function(msg){
                     // as it turns out nan is not valid JSON
                     var body;
                     try {
@@ -145,14 +226,14 @@ module.exports = function(config) {
             }
 
             return Promise.try(function(){
-                return results.concat(augmentedPayloads);
+                return theResults.concat(augmentedPayloads);
             }).then(function(results){
+                var theseResults = results;
                 // if there's a non-null status object provided
                 // lets reach into the status.filename
                 // and modify the entry for status.serialnumber
-                if(status && status.filename) {
-                    return Promise.try(function () {
-                        var content = fs.readFileSync(status.filename, 'utf8');
+                if(theStatus && theStatus.filename) {
+                    var content = fs.readFileSync(theStatus.filename, 'utf8');
                         if(content == ""){
                             content = "{}";
                         }
@@ -161,28 +242,28 @@ module.exports = function(config) {
 
                         try {
                             json = JSON.parse(content);
-                            if (!json[status.serialNumber]) {
-                                json[status.serialNumber] = {};
+                          if (!json[theStatus.serialNumber]) {
+                            json[theStatus.serialNumber] = {};
                             }
 
-                            if (response.body.messages) {
-                                json[status.serialNumber].numResults = results.length + response.body.messages.length;
+                        if (theResponse.body.messages) {
+                            json[theStatus.serialNumber].numResults = theseResults.length + theResponse.body.messages.length;
                             }
                             else {
-                                json[status.serialNumber].complete = true;
-                                json[status.serialNumber].error = true;
-                                json[status.serialNumber].errorMessage = "No messages found.";
+                            json[theStatus.serialNumber].complete = true;
+                            json[theStatus.serialNumber].error = true;
+                            json[theStatus.serialNumber].errorMessage = "No messages found.";
                             }
 
-                            if (results.length > 0) {
-                                json[status.serialNumber].timestamp = results[results.length - 1].timestamp;
+                        if (theseResults.length > 0) {
+                            json[theStatus.serialNumber].timestamp = theseResults[theseResults.length - 1].timestamp;
                             }
 
-                            if (!response.body.next) {
-                                json[status.serialNumber].complete = true;
+                        if (!theResponse.body.next) {
+                            json[theStatus.serialNumber].complete = true;
                             }
                             else {
-                                json[status.serialNumber].complete = false;
+                            json[theStatus.serialNumber].complete = false;
                             }
                         }
                         catch(err){
@@ -191,45 +272,51 @@ module.exports = function(config) {
                         }
 
                         if(json) {
-                            return fs.writeFileSync(status.filename, JSON.stringify(json));
+                        try {
+                            fs.writeFileSync(theStatus.filename, JSON.stringify(json));
                         }
-                        else{
-                            return null;
+                        catch(error){
+                            console.log(error.message);
                         }
-                    }).then(function(){
-                        return results;
-                    });
+                    }
+                    console.log(theStatus.serialNumber + " Wrote "+ JSON.stringify(json) + " to " + theStatus.filename);
+                    return theseResults;
                 }
                 else {
-                    return results; // pass it through
+                    return theseResults; // pass it through
                 }
             }).delay(1000).then(function(newResults){
-                if(followNext && response.body.next){
-                    console.log("Next Found on url " + url);
-                    console.log("Last timestamp: " + response.body.messages[response.body.messages.length - 1].date);
-                    return recursiveGET(API_BASE_URL + response.body.next, newResults, status, followNext);
+                if(theFollowNext && theResponse.body.next){
+                    console.log("Next Found on url " + theUrl);
+                    console.log("Last timestamp: " + theResponse.body.messages[theResponse.body.messages.length - 1].date);
+                    return recursiveGET(API_BASE_URL + theResponse.body.next, newResults, theStatus, theFollowNext);
                 }
                 else{
-                    console.log("Next Not Found on url " + url);
+                    console.log(theStatus.serialNumber + " Next Not Found on url " + theUrl);
                     // console.log(response.body);
-                    if(response.body.messages && response.body.messages.length > 0) {
-                        console.log("Response contained messages field with " + response.body.messages.length
-                          + " messages, Last timestamp: " + response.body.messages[response.body.messages.length - 1].date);
+                    if(theResponse.body.messages && theResponse.body.messages.length > 0) {
+                        console.log("Response contained messages field with " + theResponse.body.messages.length
+                          + " messages, Last timestamp: " + theResponse.body.messages[theResponse.body.messages.length - 1].date);
                     }
-                    else if(!response.body.messages){
+                    else if(!theResponse.body.messages){
                        console.log("Response did not contain any messages field");
                     }
-                    else if(response.body.messages.length === 0){
+                    else if(theResponse.body.messages.length === 0){
                        console.log("Response contained messages field with zero messages");
                     }
                     else{
                        console.log("Unexpected response content: ");
-                       console.log(response.body);
+                       console.log(theResponse.body);
                     }
                     console.log("Total Results: " + newResults.length);
                     return newResults;
                 }
             });
+        }).catch(function(error){
+            console.log("***********************");
+            console.log("Error: " + error.message + " " + error.stack);
+            console.log("***********************");
+            return [];
         });
     };
 
@@ -263,7 +350,7 @@ module.exports = function(config) {
 
         url += "/" + val+ urlParams(params);
 
-        var status = params ? params.status : null;
+        var status = params ? Object.assign({}, {}, params.status) : null;
 
         return recursiveGET(url, [], status); // don't follow next, that is up to the caller for a proxy
     }
